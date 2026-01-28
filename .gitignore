@@ -1,0 +1,26 @@
+# Environment Variables
+.env
+env/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Sessions
+*.session
+*.session-journal
+
+# Logs & Temp
+logs.txt
+downloads/
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# Specific Files
+Coursesbuying Login.session
+1464downstatus.txt
