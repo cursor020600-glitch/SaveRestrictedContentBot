@@ -283,16 +283,17 @@ async def handle_batch_responses(client: Client, message: Message):
                 logger.error(f"Failed to resolve chat {chat_id}: {e}")
             
             message_ids = list(range(start_id, end_id + 1))
+            processed_count = 0
             
             # Process in chunks
-            for idx, i in enumerate(range(0, len(message_ids), 20)):
+            for i in range(0, len(message_ids), 20):
                 # Check for cancellation
                 if should_cancel(user_id):
                     await sts.edit_text(
                         f"<b>⚠️ Batch Cancelled!\n\n"
                         f"✅ Success: {success_count}\n"
                         f"❌ Failed: {failed_count}\n"
-                        f"📊 Total: {idx}/{total_messages}</b>",
+                        f"📊 Total: {processed_count}/{total_messages}</b>",
                         parse_mode=enums.ParseMode.HTML
                     )
                     break
@@ -324,18 +325,19 @@ async def handle_batch_responses(client: Client, message: Message):
                     # Process each message
                     for msg in msgs:
                         if not msg or msg.empty:
+                            failed_count += 1
+                            processed_count += 1
                             continue
                         
                         # Update progress
-                        current_idx = idx + 1
-                        await update_batch_progress(user_id, current_idx, success_count)
+                        await update_batch_progress(user_id, processed_count, success_count)
                         
-                        # Update status every 10 messages
-                        if current_idx % 10 == 0:
+                        # Update status every 5 messages
+                        if processed_count % 5 == 0:
                             try:
                                 await sts.edit_text(
                                     f"<b>⚡ Processing...\n\n"
-                                    f"📊 Progress: {current_idx}/{total_messages}\n"
+                                    f"📊 Progress: {processed_count}/{total_messages}\n"
                                     f"✅ Success: {success_count}\n"
                                     f"❌ Failed: {failed_count}</b>",
                                     parse_mode=enums.ParseMode.HTML
@@ -345,6 +347,8 @@ async def handle_batch_responses(client: Client, message: Message):
                         
                         # Check if message has media or text
                         if not (msg.media or msg.text):
+                            failed_count += 1
+                            processed_count += 1
                             continue
                         
                         retry_count = 0
@@ -352,8 +356,12 @@ async def handle_batch_responses(client: Client, message: Message):
                         
                         while retry_count < 3 and not message_sent:
                             try:
-                                # Try direct forward first
-                                await acc.forward_messages(user_id, chat_id, [msg.id])
+                                # Try direct forward first (IMPORTANT: forward TO user_id from acc)
+                                await acc.forward_messages(
+                                    chat_id=user_id,  # Send TO user
+                                    from_chat_id=chat_id,  # FROM source chat
+                                    message_ids=[msg.id]
+                                )
                                 success_count += 1
                                 message_sent = True
                                 await asyncio.sleep(0.5)
@@ -368,15 +376,14 @@ async def handle_batch_responses(client: Client, message: Message):
                                 error_str = str(e)
                                 
                                 # Fallback to download-upload for restricted content
-                                if "CHAT_FORWARDS_RESTRICTED" in error_str or "400" in error_str:
+                                if "CHAT_FORWARDS_RESTRICTED" in error_str or "CHAT_SEND_MEDIA_FORBIDDEN" in error_str or "MESSAGE_ID_INVALID" in error_str:
                                     try:
                                         # Handle text messages
-                                        if msg.text:
+                                        if msg.text and not msg.media:
                                             await client.send_message(
                                                 user_id, 
                                                 msg.text, 
-                                                entities=msg.entities,
-                                                parse_mode=enums.ParseMode.HTML
+                                                entities=msg.entities
                                             )
                                             success_count += 1
                                             message_sent = True
@@ -495,11 +502,15 @@ async def handle_batch_responses(client: Client, message: Message):
                                     failed_count += 1
                                     retry_count += 1
                         
-                        idx += 1
+                        if not message_sent:
+                            failed_count += 1
+                        
+                        processed_count += 1
                         
                 except Exception as e:
                     logger.error(f"Error in batch loop: {e}")
                     failed_count += len(chunk)
+                    processed_count += len(chunk)
             
             # Final update
             await sts.edit_text(
