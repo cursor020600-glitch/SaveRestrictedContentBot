@@ -1,5 +1,8 @@
 import re
 import asyncio
+import time
+import os
+import json
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message
 from pyrogram.errors import FloodWait, AuthKeyUnregistered, UserDeactivated, UserDeactivatedBan
@@ -9,31 +12,99 @@ from logger import LOGGER
 
 logger = LOGGER(__name__)
 
-# User state storage: {user_id: {"step": "WAITFIRST", "chat_id": None, "start_id": None}}
+# User state storage
 BATCH_STATE = {}
+
+# Active users tracking for cancel functionality
+ACTIVE_USERS = {}
+ACTIVE_USERS_FILE = "active_users.json"
+
+# Progress tracking
+P = {}
+
+def sanitize(filename):
+    """Sanitize filename to remove invalid characters"""
+    return re.sub(r'[<>:"/\\|?*\']', '_', filename).strip(" .")[:255]
+
+def load_active_users():
+    """Load active users from file"""
+    try:
+        if os.path.exists(ACTIVE_USERS_FILE):
+            with open(ACTIVE_USERS_FILE, 'r') as f:
+                return json.load(f)
+        return {}
+    except Exception:
+        return {}
+
+async def save_active_users_to_file():
+    """Save active users to file"""
+    try:
+        with open(ACTIVE_USERS_FILE, 'w') as f:
+            json.dump(ACTIVE_USERS, f)
+    except Exception as e:
+        logger.error(f"Error saving active users: {e}")
+
+async def add_active_batch(user_id: int, batch_info: dict):
+    """Add user to active batch list"""
+    ACTIVE_USERS[str(user_id)] = batch_info
+    await save_active_users_to_file()
+
+def is_user_active(user_id: int) -> bool:
+    """Check if user has active batch"""
+    return str(user_id) in ACTIVE_USERS
+
+async def update_batch_progress(user_id: int, current: int, success: int):
+    """Update batch progress"""
+    if str(user_id) in ACTIVE_USERS:
+        ACTIVE_USERS[str(user_id)]["current"] = current
+        ACTIVE_USERS[str(user_id)]["success"] = success
+        await save_active_users_to_file()
+
+async def request_batch_cancel(user_id: int):
+    """Request batch cancellation"""
+    if str(user_id) in ACTIVE_USERS:
+        ACTIVE_USERS[str(user_id)]["cancel_requested"] = True
+        await save_active_users_to_file()
+        return True
+    return False
+
+def should_cancel(user_id: int) -> bool:
+    """Check if cancellation requested"""
+    user_str = str(user_id)
+    return user_str in ACTIVE_USERS and ACTIVE_USERS[user_str].get("cancel_requested", False)
+
+async def remove_active_batch(user_id: int):
+    """Remove user from active batch list"""
+    if str(user_id) in ACTIVE_USERS:
+        del ACTIVE_USERS[str(user_id)]
+        await save_active_users_to_file()
+
+def get_batch_info(user_id: int) -> dict:
+    """Get batch info for user"""
+    return ACTIVE_USERS.get(str(user_id))
+
+# Load active users on startup
+ACTIVE_USERS = load_active_users()
 
 def parse_msg_link(link):
     """Parses a telegram message link to extract chat_id and message_id."""
-    # Public: https://t.me/channel/123 or https://t.me/c/123456789/123
+    # Private: https://t.me/c/123456789/123
     if "t.me/c/" in link:
-        # Private
         match = re.match(r"https://t\.me/c/(\d+)/(\d+)", link)
         if match:
             chat_id = int("-100" + match.group(1))
             return chat_id, int(match.group(2))
     else:
-        # Public
+        # Public: https://t.me/channel/123
         match = re.match(r"https://t\.me/([^/]+)/(\d+)", link)
         if match:
             return match.group(1), int(match.group(2))
     return None, None
 
-
-# Helper to get Chat ID from forward safely
 def get_forward_chat_id(message: Message):
+    """Get chat ID from forwarded message"""
     if message.forward_from_chat:
         return message.forward_from_chat.id
-    # Pyrogram 2.x deprecation fallback
     if getattr(message, "forward_origin", None) and getattr(message.forward_origin, "chat", None):
         return message.forward_origin.chat.id
     return None
@@ -48,14 +119,75 @@ def get_msg_info(message: Message):
         return parse_msg_link(message.text)
     return None, None
 
+async def prog(current, total, client, chat_id, message_id, start_time):
+    """Progress callback with better UI"""
+    global P
+    percentage = current / total * 100
+    
+    # Adaptive interval based on file size
+    if total >= 100 * 1024 * 1024:
+        interval = 10
+    elif total >= 50 * 1024 * 1024:
+        interval = 20
+    elif total >= 10 * 1024 * 1024:
+        interval = 30
+    else:
+        interval = 50
+    
+    step = int(percentage // interval) * interval
+    
+    if message_id not in P or P[message_id] != step or percentage >= 100:
+        P[message_id] = step
+        current_mb = current / (1024 * 1024)
+        total_mb = total / (1024 * 1024)
+        
+        # Progress bar
+        bar = '🟢' * int(percentage / 10) + '🔴' * (10 - int(percentage / 10))
+        
+        # Speed calculation
+        elapsed_time = time.time() - start_time
+        speed = current / elapsed_time / (1024 * 1024) if elapsed_time > 0 else 0
+        
+        # ETA calculation
+        if speed > 0:
+            eta_seconds = (total - current) / (speed * 1024 * 1024)
+            eta = time.strftime('%M:%S', time.gmtime(eta_seconds))
+        else:
+            eta = '00:00'
+        
+        try:
+            await client.edit_message_text(
+                chat_id, message_id,
+                f"__**Processing...**__\n\n{bar}\n\n"
+                f"⚡**Completed**: {current_mb:.2f} MB / {total_mb:.2f} MB\n"
+                f"📊 **Done**: {percentage:.2f}%\n"
+                f"🚀 **Speed**: {speed:.2f} MB/s\n"
+                f"⏳ **ETA**: {eta}"
+            )
+        except:
+            pass
+        
+        if percentage >= 100:
+            P.pop(message_id, None)
+
 @Client.on_message(filters.command("batch") & filters.private)
 async def batch_cmd(client: Client, message: Message):
     user_id = message.from_user.id
+    
+    # Check if user already has active batch
+    if is_user_active(user_id):
+        await message.reply_text(
+            "<b>⚠️ You already have an active batch process.\n"
+            "Use /cancel to stop it first.</b>",
+            parse_mode=enums.ParseMode.HTML
+        )
+        return
+    
     BATCH_STATE[user_id] = {"step": "WAITFIRST"}
     await message.reply_text(
-        "<b>Forward the batch FIRST message from your batch channel (with forward tag)\n"
+        "<b>📤 Forward the batch FIRST message from your batch channel (with forward tag)\n"
         "OR\n"
-        "Send me the batch FIRST message link from your batch channel.</b>",
+        "📎 Send me the batch FIRST message link from your batch channel.</b>",
         parse_mode=enums.ParseMode.HTML
     )
 
@@ -64,7 +196,7 @@ async def is_batch_waiting(_, __, message):
 
 batch_filter = filters.create(is_batch_waiting)
 
-@Client.on_message(filters.private & batch_filter & ~filters.command(["batch", "start", "cancel"]))
+@Client.on_message(filters.private & batch_filter & ~filters.command(["batch", "start", "cancel", "stop"]))
 async def handle_batch_responses(client: Client, message: Message):
     user_id = message.from_user.id
     state = BATCH_STATE[user_id]
@@ -72,45 +204,76 @@ async def handle_batch_responses(client: Client, message: Message):
     chat_id, msg_id = get_msg_info(message)
     
     if chat_id is None or msg_id is None:
-        return await message.reply_text("<b>❌ Please provide a valid forwarded message or Telegram link.</b>")
+        return await message.reply_text(
+            "<b>❌ Please provide a valid forwarded message or Telegram link.</b>",
+            parse_mode=enums.ParseMode.HTML
+        )
 
     if state["step"] == "WAITFIRST":
         state["step"] = "WAITLAST"
         state["chat_id"] = chat_id
         state["start_id"] = msg_id
         await message.reply_text(
-            "<b>Forward the batch LAST message from your batch channel (with forward tag)\n"
+            "<b>📤 Forward the batch LAST message from your batch channel (with forward tag)\n"
             "OR\n"
-            "Send me the batch LAST message link from your batch channel.</b>",
+            "📎 Send me the batch LAST message link from your batch channel.</b>",
             parse_mode=enums.ParseMode.HTML
         )
     
     elif state["step"] == "WAITLAST":
         if chat_id != state["chat_id"]:
-            return await message.reply_text("<b>❌ The last message must be from the same chat as the first.</b>")
+            return await message.reply_text(
+                "<b>❌ The last message must be from the same chat as the first.</b>",
+                parse_mode=enums.ParseMode.HTML
+            )
         
         start_id = state["start_id"]
         end_id = msg_id
-        del BATCH_STATE[user_id] # Clear state
+        del BATCH_STATE[user_id]  # Clear state
         
         # Ensure range is correct
         if start_id > end_id:
             start_id, end_id = end_id, start_id
-
-        sts = await message.reply_text("<b>🚀 Batch Processing Started...</b>")
         
-        # Get User Session for restricted content
+        total_messages = end_id - start_id + 1
+        
+        sts = await message.reply_text(
+            f"<b>🚀 Batch Processing Started...\n"
+            f"📊 Total Messages: {total_messages}</b>",
+            parse_mode=enums.ParseMode.HTML
+        )
+        
+        # Get User Session
         user_sess = await db.get_session(user_id)
         if not user_sess:
-            return await sts.edit_text("<b>❌ You must /login first to use batch mode for restricted content.</b>")
+            return await sts.edit_text(
+                "<b>❌ You must /login first to use batch mode for restricted content.</b>",
+                parse_mode=enums.ParseMode.HTML
+            )
 
-        # Use a unique session name to avoid conflicts
-        import time
-        acc = Client(f"batch_{user_id}_{int(time.time())}", session_string=user_sess, api_hash=API_HASH, api_id=API_ID, in_memory=True)
+        # Create user client
+        acc = Client(
+            f"batch_{user_id}_{int(time.time())}", 
+            session_string=user_sess, 
+            api_hash=API_HASH, 
+            api_id=API_ID, 
+            in_memory=True
+        )
         
-        videos_count = 0
+        success_count = 0
+        failed_count = 0
+        
         try:
             await acc.connect()
+            
+            # Add to active users
+            await add_active_batch(user_id, {
+                "total": total_messages,
+                "current": 0,
+                "success": 0,
+                "cancel_requested": False,
+                "progress_message_id": sts.id
+            })
             
             # Resolve peer
             try:
@@ -121,146 +284,271 @@ async def handle_batch_responses(client: Client, message: Message):
             
             message_ids = list(range(start_id, end_id + 1))
             
-            # Process one by one to handle mix of restricted/unrestricted cleanly and allow fallback
-            # (Fetching in chunks is good, but processing one by one allows falling back for specific failures)
-            
-            # Process one by one with retry mechanism for FloodWait
-            for i in range(0, len(message_ids), 20):
+            # Process in chunks
+            for idx, i in enumerate(range(0, len(message_ids), 20)):
+                # Check for cancellation
+                if should_cancel(user_id):
+                    await sts.edit_text(
+                        f"<b>⚠️ Batch Cancelled!\n\n"
+                        f"✅ Success: {success_count}\n"
+                        f"❌ Failed: {failed_count}\n"
+                        f"📊 Total: {idx}/{total_messages}</b>",
+                        parse_mode=enums.ParseMode.HTML
+                    )
+                    break
+                
                 chunk = message_ids[i:i+20]
+                
                 try:
+                    # Fetch messages with retry
                     msgs = []
-                    while True:
+                    retry_count = 0
+                    while retry_count < 3:
                         try:
                             msgs = await acc.get_messages(chat_id, chunk)
                             break
                         except FloodWait as fw:
+                            logger.warning(f"FloodWait: {fw.value} seconds")
                             await asyncio.sleep(fw.value + 5)
                             continue
                         except Exception as e:
                             logger.error(f"Error fetching chunk: {e}")
-                            break
+                            retry_count += 1
+                            if retry_count >= 3:
+                                break
+                            await asyncio.sleep(5)
 
                     if not isinstance(msgs, list):
                         msgs = [msgs]
                     
+                    # Process each message
                     for msg in msgs:
                         if not msg or msg.empty:
                             continue
                         
-                        # Check for any media or text
-                        is_target = False
-                        if msg.media or msg.text:
-                            is_target = True
+                        # Update progress
+                        current_idx = idx + 1
+                        await update_batch_progress(user_id, current_idx, success_count)
                         
-                        if is_target:
-                            retry_count = 0
-                            while retry_count < 3:
-                                try:
-                                    # 1. Try Direct Forward (Fastest)
-                                    await acc.forward_messages(user_id, chat_id, [msg.id])
-                                    videos_count += 1
-                                    await asyncio.sleep(0.5)
-                                    break
-                                except FloodWait as fw:
-                                    await asyncio.sleep(fw.value + 5)
-                                    retry_count = 0 # Reset retry on flood wait to keep trying
-                                    continue
-                                except Exception as e:
-                                    # 2. Fallback to Download -> Upload
-                                    error_str = str(e)
-                                    if "CHAT_FORWARDS_RESTRICTED" in error_str or "400" in error_str:
-                                        try:
-                                            # Status update
-                                            # await sts.edit_text(f"<b>⚠️ Restricted Content Detected. Downloading... ({videos_count} done)</b>")
-                                            # (Commented out to reduce flood wait on edits)
-
-                                            # Handle Text
-                                            if msg.text:
-                                                await client.send_message(user_id, msg.text, entities=msg.entities, parse_mode=enums.ParseMode.HTML)
-                                                videos_count += 1
-                                                break
-
-                                            # Download media
-                                            file_path = await acc.download_media(msg)
-                                            
-                                            # Upload to user based on type
-                                            caption = msg.caption or ""
-                                            
-                                            if msg.photo:
-                                                await client.send_photo(user_id, file_path, caption=caption)
-                                            elif msg.video:
-                                                thumb_path = None
-                                                try:
-                                                    if msg.video.thumbs:
-                                                        thumb_path = await acc.download_media(msg.video.thumbs[0].file_id)
-                                                except:
-                                                    pass
-                                                await client.send_video(user_id, file_path, caption=caption, supports_streaming=True, thumb=thumb_path)
-                                                if thumb_path and os.path.exists(thumb_path):
-                                                    os.remove(thumb_path)
-                                            elif msg.audio:
-                                                thumb_path = None
-                                                try:
-                                                    if msg.audio.thumbs:
-                                                        thumb_path = await acc.download_media(msg.audio.thumbs[0].file_id)
-                                                except:
-                                                    pass
-                                                await client.send_audio(user_id, file_path, caption=caption, thumb=thumb_path)
-                                                if thumb_path and os.path.exists(thumb_path):
-                                                    os.remove(thumb_path)
-                                            elif msg.voice:
-                                                await client.send_voice(user_id, file_path, caption=caption)
-                                            elif msg.document:
-                                                thumb_path = None
-                                                try:
-                                                    if msg.document.thumbs:
-                                                        thumb_path = await acc.download_media(msg.document.thumbs[0].file_id)
-                                                except:
-                                                    pass
-                                                await client.send_document(user_id, file_path, caption=caption, thumb=thumb_path)
-                                                if thumb_path and os.path.exists(thumb_path):
-                                                    os.remove(thumb_path)
-                                            elif msg.sticker:
-                                                await client.send_sticker(user_id, file_path)
-                                            elif msg.animation:
-                                                await client.send_animation(user_id, file_path, caption=caption) 
-                                            else:
-                                                await client.send_document(user_id, file_path, caption=caption)
-                                            
-                                            # Cleanup
-                                            import os
-                                            if os.path.exists(file_path):
-                                                os.remove(file_path)
-                                                
-                                            videos_count += 1
+                        # Update status every 10 messages
+                        if current_idx % 10 == 0:
+                            try:
+                                await sts.edit_text(
+                                    f"<b>⚡ Processing...\n\n"
+                                    f"📊 Progress: {current_idx}/{total_messages}\n"
+                                    f"✅ Success: {success_count}\n"
+                                    f"❌ Failed: {failed_count}</b>",
+                                    parse_mode=enums.ParseMode.HTML
+                                )
+                            except:
+                                pass
+                        
+                        # Check if message has media or text
+                        if not (msg.media or msg.text):
+                            continue
+                        
+                        retry_count = 0
+                        message_sent = False
+                        
+                        while retry_count < 3 and not message_sent:
+                            try:
+                                # Try direct forward first
+                                await acc.forward_messages(user_id, chat_id, [msg.id])
+                                success_count += 1
+                                message_sent = True
+                                await asyncio.sleep(0.5)
+                                break
+                                
+                            except FloodWait as fw:
+                                logger.warning(f"FloodWait on forward: {fw.value} seconds")
+                                await asyncio.sleep(fw.value + 5)
+                                continue
+                                
+                            except Exception as e:
+                                error_str = str(e)
+                                
+                                # Fallback to download-upload for restricted content
+                                if "CHAT_FORWARDS_RESTRICTED" in error_str or "400" in error_str:
+                                    try:
+                                        # Handle text messages
+                                        if msg.text:
+                                            await client.send_message(
+                                                user_id, 
+                                                msg.text, 
+                                                entities=msg.entities,
+                                                parse_mode=enums.ParseMode.HTML
+                                            )
+                                            success_count += 1
+                                            message_sent = True
                                             break
-                                        except FloodWait as fw:
-                                            await asyncio.sleep(fw.value + 5)
-                                            continue
-                                        except Exception as dl_e:
-                                            logger.error(f"Download fallback failed: {dl_e}")
-                                            retry_count += 1
-                                    else:
-                                        logger.error(f"Forward failed: {e}")
+
+                                        # Download media
+                                        download_msg = await client.send_message(
+                                            user_id, 
+                                            "⬇️ Downloading restricted content..."
+                                        )
+                                        
+                                        start_time = time.time()
+                                        file_path = await acc.download_media(
+                                            msg,
+                                            progress=prog,
+                                            progress_args=(
+                                                client, 
+                                                user_id, 
+                                                download_msg.id, 
+                                                start_time
+                                            )
+                                        )
+                                        
+                                        if not file_path:
+                                            await download_msg.delete()
+                                            failed_count += 1
+                                            break
+                                        
+                                        await download_msg.edit_text("⬆️ Uploading...")
+                                        
+                                        caption = msg.caption or ""
+                                        thumb_path = None
+                                        
+                                        # Upload based on media type
+                                        if msg.photo:
+                                            await client.send_photo(
+                                                user_id, file_path, caption=caption
+                                            )
+                                        elif msg.video:
+                                            try:
+                                                if msg.video.thumbs:
+                                                    thumb_path = await acc.download_media(
+                                                        msg.video.thumbs[0].file_id
+                                                    )
+                                            except:
+                                                pass
+                                            await client.send_video(
+                                                user_id, file_path, 
+                                                caption=caption,
+                                                supports_streaming=True, 
+                                                thumb=thumb_path
+                                            )
+                                        elif msg.audio:
+                                            try:
+                                                if msg.audio.thumbs:
+                                                    thumb_path = await acc.download_media(
+                                                        msg.audio.thumbs[0].file_id
+                                                    )
+                                            except:
+                                                pass
+                                            await client.send_audio(
+                                                user_id, file_path, 
+                                                caption=caption, 
+                                                thumb=thumb_path
+                                            )
+                                        elif msg.voice:
+                                            await client.send_voice(
+                                                user_id, file_path, caption=caption
+                                            )
+                                        elif msg.document:
+                                            try:
+                                                if msg.document.thumbs:
+                                                    thumb_path = await acc.download_media(
+                                                        msg.document.thumbs[0].file_id
+                                                    )
+                                            except:
+                                                pass
+                                            await client.send_document(
+                                                user_id, file_path, 
+                                                caption=caption, 
+                                                thumb=thumb_path
+                                            )
+                                        elif msg.sticker:
+                                            await client.send_sticker(user_id, file_path)
+                                        elif msg.animation:
+                                            await client.send_animation(
+                                                user_id, file_path, caption=caption
+                                            )
+                                        else:
+                                            await client.send_document(
+                                                user_id, file_path, caption=caption
+                                            )
+                                        
+                                        # Cleanup
+                                        if os.path.exists(file_path):
+                                            os.remove(file_path)
+                                        if thumb_path and os.path.exists(thumb_path):
+                                            os.remove(thumb_path)
+                                        
+                                        await download_msg.delete()
+                                        success_count += 1
+                                        message_sent = True
+                                        break
+                                        
+                                    except FloodWait as fw:
+                                        logger.warning(f"FloodWait on download: {fw.value}")
+                                        await asyncio.sleep(fw.value + 5)
+                                        continue
+                                        
+                                    except Exception as dl_e:
+                                        logger.error(f"Download fallback failed: {dl_e}")
+                                        failed_count += 1
                                         retry_count += 1
+                                else:
+                                    logger.error(f"Forward failed: {e}")
+                                    failed_count += 1
+                                    retry_count += 1
+                        
+                        idx += 1
                         
                 except Exception as e:
                     logger.error(f"Error in batch loop: {e}")
+                    failed_count += len(chunk)
             
-            await sts.edit_text(f"<b>✅ Batch Complete! Sent `{videos_count}` messages.</b>")
+            # Final update
+            await sts.edit_text(
+                f"<b>✅ Batch Complete!\n\n"
+                f"📊 Total Messages: {total_messages}\n"
+                f"✅ Success: {success_count}\n"
+                f"❌ Failed: {failed_count}</b>",
+                parse_mode=enums.ParseMode.HTML
+            )
+            
         except Exception as e:
-            await sts.edit_text(f"<b>❌ Error: {e}</b>")
+            logger.error(f"Batch error: {e}")
+            await sts.edit_text(
+                f"<b>❌ Error: {str(e)[:100]}\n\n"
+                f"✅ Success: {success_count}\n"
+                f"❌ Failed: {failed_count}</b>",
+                parse_mode=enums.ParseMode.HTML
+            )
         finally:
+            await remove_active_batch(user_id)
             try:
                 await acc.disconnect()
             except:
                 pass
 
-@Client.on_message(filters.command(["cancel", "cancell"]) & filters.private)
+@Client.on_message(filters.command(["cancel", "stop"]) & filters.private)
 async def cancel_batch_cmd(client: Client, message: Message):
     user_id = message.from_user.id
-    if user_id in BATCH_STATE:
+    
+    if is_user_active(user_id):
+        if await request_batch_cancel(user_id):
+            await message.reply_text(
+                "<b>⚠️ Cancellation Requested!\n\n"
+                "The batch will stop after the current message completes.</b>",
+                parse_mode=enums.ParseMode.HTML
+            )
+        else:
+            await message.reply_text(
+                "<b>❌ Failed to request cancellation. Please try again.</b>",
+                parse_mode=enums.ParseMode.HTML
+            )
+    elif user_id in BATCH_STATE:
         del BATCH_STATE[user_id]
-        await message.reply_text("<b>❌ Batch Process Cancelled Successfully.</b>", parse_mode=enums.ParseMode.HTML)
+        await message.reply_text(
+            "<b>❌ Batch Process Cancelled Successfully.</b>",
+            parse_mode=enums.ParseMode.HTML
+        )
     else:
-        await message.reply_text("<b>❌ No Active Batch Process To Cancel.</b>", parse_mode=enums.ParseMode.HTML)
+        await message.reply_text(
+            "<b>❌ No Active Batch Process To Cancel.</b>",
+            parse_mode=enums.ParseMode.HTML
+        )
