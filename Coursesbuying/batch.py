@@ -251,20 +251,23 @@ async def handle_batch_responses(client: Client, message: Message):
                 parse_mode=enums.ParseMode.HTML
             )
 
-        # Create user client
+        # Create user client with proper settings - NO DATABASE
         acc = Client(
-            f"batch_{user_id}_{int(time.time())}", 
+            name=f"batch_{user_id}_{int(time.time())}", 
             session_string=user_sess, 
             api_hash=API_HASH, 
-            api_id=API_ID, 
-            in_memory=True
+            api_id=API_ID,
+            in_memory=True,  # Use in-memory storage
+            no_updates=True,  # Don't receive updates
+            workdir="/tmp"  # Use temp directory
         )
         
         success_count = 0
         failed_count = 0
         
         try:
-            await acc.connect()
+            await acc.start()
+            logger.info(f"User client started for {user_id}")
             
             # Add to active users
             await add_active_batch(user_id, {
@@ -276,9 +279,11 @@ async def handle_batch_responses(client: Client, message: Message):
             })
             
             # Resolve peer
+            resolved_chat_id = chat_id
             try:
                 chat = await acc.get_chat(chat_id)
-                chat_id = chat.id
+                resolved_chat_id = chat.id
+                logger.info(f"Resolved chat: {resolved_chat_id}")
             except Exception as e:
                 logger.error(f"Failed to resolve chat {chat_id}: {e}")
             
@@ -302,11 +307,11 @@ async def handle_batch_responses(client: Client, message: Message):
                 
                 try:
                     # Fetch messages with retry
-                    msgs = []
+                    msgs = None
                     retry_count = 0
                     while retry_count < 3:
                         try:
-                            msgs = await acc.get_messages(chat_id, chunk)
+                            msgs = await acc.get_messages(resolved_chat_id, chunk)
                             break
                         except FloodWait as fw:
                             logger.warning(f"FloodWait: {fw.value} seconds")
@@ -318,6 +323,11 @@ async def handle_batch_responses(client: Client, message: Message):
                             if retry_count >= 3:
                                 break
                             await asyncio.sleep(5)
+
+                    if not msgs:
+                        failed_count += len(chunk)
+                        processed_count += len(chunk)
+                        continue
 
                     if not isinstance(msgs, list):
                         msgs = [msgs]
@@ -356,15 +366,16 @@ async def handle_batch_responses(client: Client, message: Message):
                         
                         while retry_count < 3 and not message_sent:
                             try:
-                                # Try direct forward first (IMPORTANT: forward TO user_id from acc)
+                                # Try direct forward first
                                 await acc.forward_messages(
-                                    chat_id=user_id,  # Send TO user
-                                    from_chat_id=chat_id,  # FROM source chat
-                                    message_ids=[msg.id]
+                                    chat_id=user_id,
+                                    from_chat_id=resolved_chat_id,
+                                    message_ids=msg.id
                                 )
                                 success_count += 1
                                 message_sent = True
-                                await asyncio.sleep(0.5)
+                                logger.info(f"Forwarded message {msg.id} to user {user_id}")
+                                await asyncio.sleep(1)  # Small delay between forwards
                                 break
                                 
                             except FloodWait as fw:
@@ -374,6 +385,7 @@ async def handle_batch_responses(client: Client, message: Message):
                                 
                             except Exception as e:
                                 error_str = str(e)
+                                logger.error(f"Forward error: {error_str}")
                                 
                                 # Fallback to download-upload for restricted content
                                 if "CHAT_FORWARDS_RESTRICTED" in error_str or "CHAT_SEND_MEDIA_FORBIDDEN" in error_str or "MESSAGE_ID_INVALID" in error_str:
@@ -387,6 +399,7 @@ async def handle_batch_responses(client: Client, message: Message):
                                             )
                                             success_count += 1
                                             message_sent = True
+                                            logger.info(f"Sent text message to user {user_id}")
                                             break
 
                                         # Download media
@@ -396,8 +409,13 @@ async def handle_batch_responses(client: Client, message: Message):
                                         )
                                         
                                         start_time = time.time()
+                                        
+                                        # Create temp filename
+                                        temp_file = f"/tmp/batch_{user_id}_{msg.id}_{int(time.time())}"
+                                        
                                         file_path = await acc.download_media(
                                             msg,
+                                            file_name=temp_file,
                                             progress=prog,
                                             progress_args=(
                                                 client, 
@@ -418,74 +436,90 @@ async def handle_batch_responses(client: Client, message: Message):
                                         thumb_path = None
                                         
                                         # Upload based on media type
-                                        if msg.photo:
-                                            await client.send_photo(
-                                                user_id, file_path, caption=caption
-                                            )
-                                        elif msg.video:
-                                            try:
-                                                if msg.video.thumbs:
-                                                    thumb_path = await acc.download_media(
-                                                        msg.video.thumbs[0].file_id
-                                                    )
-                                            except:
-                                                pass
-                                            await client.send_video(
-                                                user_id, file_path, 
-                                                caption=caption,
-                                                supports_streaming=True, 
-                                                thumb=thumb_path
-                                            )
-                                        elif msg.audio:
-                                            try:
-                                                if msg.audio.thumbs:
-                                                    thumb_path = await acc.download_media(
-                                                        msg.audio.thumbs[0].file_id
-                                                    )
-                                            except:
-                                                pass
-                                            await client.send_audio(
-                                                user_id, file_path, 
-                                                caption=caption, 
-                                                thumb=thumb_path
-                                            )
-                                        elif msg.voice:
-                                            await client.send_voice(
-                                                user_id, file_path, caption=caption
-                                            )
-                                        elif msg.document:
-                                            try:
-                                                if msg.document.thumbs:
-                                                    thumb_path = await acc.download_media(
-                                                        msg.document.thumbs[0].file_id
-                                                    )
-                                            except:
-                                                pass
-                                            await client.send_document(
-                                                user_id, file_path, 
-                                                caption=caption, 
-                                                thumb=thumb_path
-                                            )
-                                        elif msg.sticker:
-                                            await client.send_sticker(user_id, file_path)
-                                        elif msg.animation:
-                                            await client.send_animation(
-                                                user_id, file_path, caption=caption
-                                            )
-                                        else:
-                                            await client.send_document(
-                                                user_id, file_path, caption=caption
-                                            )
+                                        try:
+                                            if msg.photo:
+                                                await client.send_photo(
+                                                    user_id, file_path, caption=caption
+                                                )
+                                            elif msg.video:
+                                                try:
+                                                    if msg.video.thumbs:
+                                                        thumb_path = await acc.download_media(
+                                                            msg.video.thumbs[0].file_id,
+                                                            file_name=f"/tmp/thumb_{user_id}_{msg.id}.jpg"
+                                                        )
+                                                except:
+                                                    pass
+                                                await client.send_video(
+                                                    user_id, file_path, 
+                                                    caption=caption,
+                                                    supports_streaming=True, 
+                                                    thumb=thumb_path
+                                                )
+                                            elif msg.audio:
+                                                try:
+                                                    if msg.audio.thumbs:
+                                                        thumb_path = await acc.download_media(
+                                                            msg.audio.thumbs[0].file_id,
+                                                            file_name=f"/tmp/thumb_{user_id}_{msg.id}.jpg"
+                                                        )
+                                                except:
+                                                    pass
+                                                await client.send_audio(
+                                                    user_id, file_path, 
+                                                    caption=caption, 
+                                                    thumb=thumb_path
+                                                )
+                                            elif msg.voice:
+                                                await client.send_voice(
+                                                    user_id, file_path, caption=caption
+                                                )
+                                            elif msg.document:
+                                                try:
+                                                    if msg.document.thumbs:
+                                                        thumb_path = await acc.download_media(
+                                                            msg.document.thumbs[0].file_id,
+                                                            file_name=f"/tmp/thumb_{user_id}_{msg.id}.jpg"
+                                                        )
+                                                except:
+                                                    pass
+                                                await client.send_document(
+                                                    user_id, file_path, 
+                                                    caption=caption, 
+                                                    thumb=thumb_path
+                                                )
+                                            elif msg.sticker:
+                                                await client.send_sticker(user_id, file_path)
+                                            elif msg.animation:
+                                                await client.send_animation(
+                                                    user_id, file_path, caption=caption
+                                                )
+                                            else:
+                                                await client.send_document(
+                                                    user_id, file_path, caption=caption
+                                                )
+                                            
+                                            success_count += 1
+                                            message_sent = True
+                                            logger.info(f"Uploaded media to user {user_id}")
+                                        except Exception as upload_err:
+                                            logger.error(f"Upload failed: {upload_err}")
+                                            failed_count += 1
                                         
                                         # Cleanup
-                                        if os.path.exists(file_path):
-                                            os.remove(file_path)
-                                        if thumb_path and os.path.exists(thumb_path):
-                                            os.remove(thumb_path)
+                                        try:
+                                            if file_path and os.path.exists(file_path):
+                                                os.remove(file_path)
+                                            if thumb_path and os.path.exists(thumb_path):
+                                                os.remove(thumb_path)
+                                        except:
+                                            pass
                                         
-                                        await download_msg.delete()
-                                        success_count += 1
-                                        message_sent = True
+                                        try:
+                                            await download_msg.delete()
+                                        except:
+                                            pass
+                                        
                                         break
                                         
                                     except FloodWait as fw:
@@ -532,9 +566,10 @@ async def handle_batch_responses(client: Client, message: Message):
         finally:
             await remove_active_batch(user_id)
             try:
-                await acc.disconnect()
-            except:
-                pass
+                await acc.stop()
+                logger.info(f"User client stopped for {user_id}")
+            except Exception as e:
+                logger.error(f"Error stopping client: {e}")
 
 @Client.on_message(filters.command(["cancel", "stop"]) & filters.private)
 async def cancel_batch_cmd(client: Client, message: Message):
